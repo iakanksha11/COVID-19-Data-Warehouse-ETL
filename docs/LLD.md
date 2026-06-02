@@ -1,234 +1,293 @@
-# Low Level Design — COVID-19 Data Warehouse
+# Low Level Design (LLD) — COVID-19 Data Platform
 
-## How the two SSIS packages work together
+## SSIS Control Flow — Overall Sequence
 
 ```
-  Package 1 — Staging Load          Package 2 — Warehouse Build
-  ──────────────────────────         ──────────────────────────────
-  Read covid_ecdc.csv                Read etl_metadata table
-  Load ALL columns as VARCHAR   →    Execute steps in step_order
-  into stg_covid_raw                 dim_date → dim_location → fact
-                                     Log every step to etl_execution_log
-         │                                      │
-         ▼                                      ▼
-  Run staging validation         Post-load: EXEC usp_verify_etl_load
-  (SSMS — manual gate)           PASS → done   FAIL → package fails
+┌──────────────────────────────────────────────────────┐
+│  PACKAGE 1 — Staging Load                            │
+│                                                      │
+│  Step 1: Execute SQL — TRUNCATE stg_covid_raw        │
+│  Step 2: Data Flow — CSV → stg_covid_raw (VARCHAR)   │
+│  Step 3: Execute SQL — Run staging validation        │
+│           7 checks — FAIL blocks Package 2           │
+└──────────────────────────┬───────────────────────────┘
+                           │ All checks PASS
+                           ▼
+┌──────────────────────────────────────────────────────┐
+│  PACKAGE 2 — Warehouse Build                         │
+│                                                      │
+│  Step 1: Generate run_id (NEWID())                   │
+│  Step 2: Read etl_metadata → Object variable         │
+│  Step 3: ForEach Loop — iterate metadata rows        │
+│          ├─ Log RUNNING to etl_execution_log         │
+│          ├─ Execute SQL from sql_statement           │
+│          └─ Log DONE / FAILED + rows + time          │
+│                                                      │
+│  Execution order (from etl_metadata.step_order):    │
+│    1. dim_date (generated)                           │
+│    2. dim_location (from staging)                    │
+│    3. fact_covid_daily (from staging)                │
+│    4. ml_covid_features (from staging + lag calc)    │
+│    5–8. Validation steps                             │
+│                                                      │
+│  Step 4: Execute SQL — EXEC usp_verify_etl_load      │
+└──────────────────────────────────────────────────────┘
+```
+
+---
+
+## Individual Data Flow Diagrams
+
+### Flow 1 — dim_date
+
+```
+  GENERATE                TRANSFORM                    LOAD
+  ─────────────────────────────────────────────────────────
+  ┌──────────────┐
+  │ Script Task  │  Generates date series
+  │              │  2020-01-01 → today
+  │ (no CSV)     │  using recursive loop
+  └──────┬───────┘
          │
          ▼
-  Only run Package 2 if
-  all validations pass
+  ┌──────────────┐  year        = YEAR(date)
+  │ Derived      │  month       = MONTH(date)
+  │ Column       │  month_name  = DATENAME(month, date)
+  │              │  quarter     = 'Q'+CAST(DATEPART(quarter,date) AS VARCHAR)
+  │              │  week_number = DATEPART(iso_week, date)
+  │              │  day_of_week = DATENAME(weekday, date)
+  │              │  is_weekend  = CASE WHEN DATEPART(weekday,date)
+  │              │                IN (1,7) THEN 1 ELSE 0 END
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐
+  │ OLE DB Dest  │──────────────────────────▶ dbo.dim_date
+  │ Truncate +   │  ~1,688 rows
+  │ full reload  │
+  └──────────────┘
 ```
 
 ---
 
-## Metadata Control Tables
+### Flow 2 — dim_location
 
-These two tables replace hardcoded SSIS logic. Package 2 reads them at runtime.
-
-### etl_metadata
-Defines what needs to happen. One row per step per table. Change config here,
-not in the SSIS package.
-
-```sql
-CREATE TABLE dbo.etl_metadata (
-    metadata_id      INT           IDENTITY(1,1) PRIMARY KEY,
-    package_name     VARCHAR(50),   -- 'WAREHOUSE_BUILD'
-    table_name       VARCHAR(100),  -- 'dim_location', 'fact_covid_daily'
-    step_order       INT,           -- execution sequence
-    step_type        VARCHAR(50),   -- 'TRUNCATE', 'INSERT', 'VALIDATE'
-    step_description VARCHAR(500),
-    sql_file         VARCHAR(200),  -- path to .sql file to execute
-    is_active        BIT DEFAULT 1  -- set 0 to skip without deleting
-);
 ```
-
-Rows loaded at project setup:
-
-| step_order | table_name | step_type | step_description |
-|------------|------------|-----------|-----------------|
-| 1 | dim_date | GENERATE | Truncate and regenerate all dates 2020-01-01 → today |
-| 2 | dim_location | TRUNCATE | Truncate dim_location |
-| 3 | dim_location | INSERT | Load countries from stg_covid_raw (deduplicated) |
-| 4 | fact_covid_daily | TRUNCATE | Truncate fact_covid_daily |
-| 5 | fact_covid_daily | INSERT | Load fact rows — lookup location_id and date_id |
-| 6 | fact_covid_daily | VALIDATE | EXEC usp_verify_etl_load |
-
-### etl_execution_log
-Records what actually happened. One row per step per run. Never overwritten.
-
-```sql
-CREATE TABLE dbo.etl_execution_log (
-    log_id        INT           IDENTITY(1,1) PRIMARY KEY,
-    run_id        VARCHAR(50),   -- NEWID() at package start — ties all steps together
-    metadata_id   INT,           -- FK → etl_metadata
-    table_name    VARCHAR(100),
-    step_type     VARCHAR(50),
-    status        VARCHAR(20),   -- RUNNING / DONE / FAILED / SKIPPED
-    start_time    DATETIME,
-    end_time      DATETIME,
-    rows_affected INT,
-    error_message VARCHAR(MAX)
-);
+  EXTRACT              TRANSFORM                        LOAD
+  ─────────────────────────────────────────────────────────
+  ┌──────────────┐
+  │ OLE DB       │  SELECT * FROM stg_covid_raw
+  │ Source       │
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐  continent IS NULL?
+  │ Conditional  │──── YES ──────────────────▶ dq_rejected_rows
+  │ Split DQ-01  │  (World, Asia, High income   reason: DQ-01
+  └──────┬───────┘   aggregate rows)
+         │ NO — real country row
+         ▼
+  ┌──────────────┐
+  │ Sort +       │  Deduplicate on location
+  │ Aggregate    │  Keep one row per country
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐  population: string → BIGINT
+  │ Data         │  population_density, median_age,
+  │ Conversion   │  gdp_per_capita, life_expectancy,
+  │              │  aged_65_older, aged_70_older,
+  │              │  diabetes_prevalence, extreme_poverty,
+  │              │  handwashing_facilities, female_smokers,
+  │              │  male_smokers, hospital_beds_per_thousand,
+  │              │  cardiovasc_death_rate,
+  │              │  human_development_index: string → FLOAT
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐
+  │ OLE DB Dest  │──────────────────────────▶ dbo.dim_location
+  │ Truncate +   │  ~195 rows
+  │ full reload  │
+  └──────────────┘
 ```
 
 ---
 
-## Package 1 — Staging Load (SSIS Data Flow)
-
-**Purpose:** Get the raw CSV into SQL Server as fast as possible.
-No type casting. No transformation. No rejection logic yet.
+### Flow 3 — fact_covid_daily
 
 ```
-  Flat File Source              OLE DB Destination
-  covid_ecdc.csv          →     dbo.stg_covid_raw
-  All 40 columns                All columns as VARCHAR(500)
-  Exclude: Number of Records    Except: Number of Records, Waterfall
-           Waterfall            (never loaded — BI artifacts)
+  EXTRACT              TRANSFORM                        LOAD
+  ─────────────────────────────────────────────────────────
+  ┌──────────────┐
+  │ OLE DB       │  SELECT * FROM stg_covid_raw
+  │ Source       │
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐  record_year = YEAR(TRY_CONVERT(DATE, date))
+  │ Derived      │
+  │ Column       │
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐
+  │ Conditional  │── DQ-01: continent IS NULL ──────▶ ┌─────────────────┐
+  │ Split        │── DQ-02: date IS NULL ────────────▶ │ dq_rejected_rows│
+  │ (DQ filter)  │── DQ-03: date > today ────────────▶ │ + reason code   │
+  │              │── DQ-04: location IS NULL ────────▶ │ + source values │
+  └──────┬───────┘                                     └─────────────────┘
+         │ All DQ checks passed
+         ▼
+  ┌──────────────┐  date: string → DATE
+  │ Data         │  All 52 numeric columns: string → FLOAT
+  │ Conversion   │  population: string → BIGINT
+  └──────┬───────┘
+         │
+         ▼
+  ┌──────────────┐                            ┌─────────────────────┐
+  │ Lookup       │── no match ──────────────▶ │ dq_rejected_rows    │
+  │ location_id  │  join: location =           │ reason: DQ-05       │
+  │              │  dim_location.country       │ (country not found) │
+  └──────┬───────┘                            └─────────────────────┘
+         │ match found
+         ▼
+  ┌──────────────┐                            ┌─────────────────────┐
+  │ Lookup       │── no match ──────────────▶ │ dq_rejected_rows    │
+  │ date_id      │  join: date =               │ reason: DQ-06       │
+  │              │  dim_date.date              │ (date not found)    │
+  └──────┬───────┘                            └─────────────────────┘
+         │ match found
+         ▼
+  ┌──────────────┐
+  │ OLE DB Dest  │──────────────────────────▶ dbo.fact_covid_daily
+  │ INSERT       │  ~400k rows
+  │ (pre-trunc)  │
+  └──────────────┘
 ```
 
-**Staging table — why all VARCHAR:**
-If SSIS tries to load `new_cases = ""` into a FLOAT column, the row fails.
-Load everything as string first. Validate in SSMS. Then cast in Package 2.
-One failed type conversion should not kill the entire load.
+---
 
+### Flow 4 — ml_covid_features
+
+```
+  EXTRACT              TRANSFORM                        LOAD
+  ─────────────────────────────────────────────────────────
+  ┌──────────────┐
+  │ OLE DB       │  SELECT f.*, d.*
+  │ Source       │  FROM fact_covid_daily f
+  │              │  JOIN dim_location d ON f.location_id = d.location_id
+  └──────┬───────┘  (reads from already-loaded fact table)
+         │
+         ▼
+  ┌──────────────┐  new_cases_lag_7   = LAG(new_cases, 7)  OVER (PARTITION BY location ORDER BY date)
+  │ Derived      │  new_cases_lag_14  = LAG(new_cases, 14) OVER (...)
+  │ Column       │  new_cases_lag_28  = LAG(new_cases, 28) OVER (...)
+  │ (lag calcs)  │  rolling_7d_avg    = AVG(new_cases) OVER (... ROWS 6 PRECEDING)
+  │              │  rolling_14d_avg   = AVG(new_cases) OVER (... ROWS 13 PRECEDING)
+  └──────┬───────┘  (computed via SQL in INSERT step, not SSIS Derived Column)
+         │
+         ▼
+  ┌──────────────┐
+  │ OLE DB Dest  │──────────────────────────▶ dbo.ml_covid_features
+  │ INSERT       │  ~400k rows, wide flat table
+  │ (pre-trunc)  │  all features in one row, no JOINs needed
+  └──────────────┘
+```
+
+---
+
+## DQ Filter Rules
+
+| Code | Rule | Where applied | Action |
+|------|------|--------------|--------|
+| DQ-01 | continent IS NULL — aggregate rows | dim_location + fact flow | Reject — expected, not an error |
+| DQ-02 | date IS NULL | fact flow | Reject — data error |
+| DQ-03 | date > GETDATE() | fact flow | Reject — future date |
+| DQ-04 | location IS NULL | fact flow | Reject — data error |
+| DQ-05 | location not found in dim_location | fact flow lookup | Reject — FK miss |
+| DQ-06 | date not found in dim_date | fact flow lookup | Reject — FK miss |
+
+**Negative new_cases:** Not rejected. OWID uses negative values for historical
+corrections. Load as-is. Flag count in post-load verification.
+
+---
+
+## SQL Server Table Definitions
+
+### stg_covid_raw
 ```sql
 CREATE TABLE dbo.stg_covid_raw (
-    location                         VARCHAR(500),
-    continent                        VARCHAR(500),
-    date                             VARCHAR(500),
-    iso_code                         VARCHAR(500),
-    tests_units                      VARCHAR(500),
-    aged_65_older                    VARCHAR(500),
-    aged_70_older                    VARCHAR(500),
-    cardiovasc_death_rate            VARCHAR(500),
-    deathp100k                       VARCHAR(500),
-    diabetes_prevalence              VARCHAR(500),
-    extreme_poverty                  VARCHAR(500),
-    female_smokers                   VARCHAR(500),
-    gdp_per_capita                   VARCHAR(500),
-    handwashing_facilities           VARCHAR(500),
-    hospital_beds_per_thousand       VARCHAR(500),
-    life_expectancy                  VARCHAR(500),
-    male_smokers                     VARCHAR(500),
-    median_age                       VARCHAR(500),
-    mortality_rate                   VARCHAR(500),
-    new_cases                        VARCHAR(500),
-    new_cases_per_million            VARCHAR(500),
-    new_deaths                       VARCHAR(500),
-    new_deaths_per_million           VARCHAR(500),
-    new_tests                        VARCHAR(500),
-    new_tests_per_thousand           VARCHAR(500),
-    new_tests_smoothed               VARCHAR(500),
-    new_tests_smoothed_per_thousand  VARCHAR(500),
-    population                       VARCHAR(500),
-    population_density               VARCHAR(500),
-    positive_rate                    VARCHAR(500),
-    stringency_index                 VARCHAR(500),
-    tests_per_case                   VARCHAR(500),
-    total_cases                      VARCHAR(500),
-    total_cases_per_million          VARCHAR(500),
-    total_deaths                     VARCHAR(500),
-    total_deaths_per_million         VARCHAR(500),
-    total_tests                      VARCHAR(500),
-    total_tests_per_thousand         VARCHAR(500),
-    load_timestamp                   DATETIME DEFAULT GETDATE()
+    iso_code                                  VARCHAR(500),
+    continent                                 VARCHAR(500),
+    location                                  VARCHAR(500),
+    date                                      VARCHAR(500),
+    total_cases                               VARCHAR(500),
+    new_cases                                 VARCHAR(500),
+    new_cases_smoothed                        VARCHAR(500),
+    total_deaths                              VARCHAR(500),
+    new_deaths                                VARCHAR(500),
+    new_deaths_smoothed                       VARCHAR(500),
+    total_cases_per_million                   VARCHAR(500),
+    new_cases_per_million                     VARCHAR(500),
+    new_cases_smoothed_per_million            VARCHAR(500),
+    total_deaths_per_million                  VARCHAR(500),
+    new_deaths_per_million                    VARCHAR(500),
+    new_deaths_smoothed_per_million           VARCHAR(500),
+    reproduction_rate                         VARCHAR(500),
+    icu_patients                              VARCHAR(500),
+    icu_patients_per_million                  VARCHAR(500),
+    hosp_patients                             VARCHAR(500),
+    hosp_patients_per_million                 VARCHAR(500),
+    weekly_icu_admissions                     VARCHAR(500),
+    weekly_icu_admissions_per_million         VARCHAR(500),
+    weekly_hosp_admissions                    VARCHAR(500),
+    weekly_hosp_admissions_per_million        VARCHAR(500),
+    total_tests                               VARCHAR(500),
+    new_tests                                 VARCHAR(500),
+    total_tests_per_thousand                  VARCHAR(500),
+    new_tests_per_thousand                    VARCHAR(500),
+    new_tests_smoothed                        VARCHAR(500),
+    new_tests_smoothed_per_thousand           VARCHAR(500),
+    positive_rate                             VARCHAR(500),
+    tests_per_case                            VARCHAR(500),
+    tests_units                               VARCHAR(500),
+    total_vaccinations                        VARCHAR(500),
+    people_vaccinated                         VARCHAR(500),
+    people_fully_vaccinated                   VARCHAR(500),
+    total_boosters                            VARCHAR(500),
+    new_vaccinations                          VARCHAR(500),
+    new_vaccinations_smoothed                 VARCHAR(500),
+    total_vaccinations_per_hundred            VARCHAR(500),
+    people_vaccinated_per_hundred             VARCHAR(500),
+    people_fully_vaccinated_per_hundred       VARCHAR(500),
+    total_boosters_per_hundred                VARCHAR(500),
+    new_vaccinations_smoothed_per_million     VARCHAR(500),
+    new_people_vaccinated_smoothed            VARCHAR(500),
+    new_people_vaccinated_smoothed_per_hundred VARCHAR(500),
+    stringency_index                          VARCHAR(500),
+    population_density                        VARCHAR(500),
+    median_age                                VARCHAR(500),
+    aged_65_older                             VARCHAR(500),
+    aged_70_older                             VARCHAR(500),
+    gdp_per_capita                            VARCHAR(500),
+    extreme_poverty                           VARCHAR(500),
+    cardiovasc_death_rate                     VARCHAR(500),
+    diabetes_prevalence                       VARCHAR(500),
+    female_smokers                            VARCHAR(500),
+    male_smokers                              VARCHAR(500),
+    handwashing_facilities                    VARCHAR(500),
+    hospital_beds_per_thousand                VARCHAR(500),
+    life_expectancy                           VARCHAR(500),
+    human_development_index                   VARCHAR(500),
+    population                                VARCHAR(500),
+    excess_mortality_cumulative_absolute      VARCHAR(500),
+    excess_mortality_cumulative               VARCHAR(500),
+    excess_mortality                          VARCHAR(500),
+    excess_mortality_cumulative_per_million   VARCHAR(500),
+    load_timestamp                            DATETIME DEFAULT GETDATE()
 );
 ```
-
----
-
-## Staging Validation Gate (SSMS — run before Package 2)
-
-All checks must pass before running Package 2. These are queries run manually
-in SSMS. If any FAIL — stop, investigate, fix, re-run Package 1.
-
-```sql
--- V-01: Row count — staging has data
-SELECT 'V-01 row_count' AS check_name,
-       COUNT(*) AS value,
-       CASE WHEN COUNT(*) > 0 THEN 'PASS' ELSE 'FAIL' END AS result
-FROM dbo.stg_covid_raw;
-
--- V-02: No null location
-SELECT 'V-02 null_location' AS check_name,
-       SUM(CASE WHEN location IS NULL OR location = '' THEN 1 ELSE 0 END) AS violations,
-       CASE WHEN SUM(CASE WHEN location IS NULL OR location = '' THEN 1 ELSE 0 END) = 0
-            THEN 'PASS' ELSE 'FAIL' END AS result
-FROM dbo.stg_covid_raw;
-
--- V-03: No null date
-SELECT 'V-03 null_date' AS check_name,
-       SUM(CASE WHEN date IS NULL OR date = '' THEN 1 ELSE 0 END) AS violations,
-       CASE WHEN SUM(CASE WHEN date IS NULL OR date = '' THEN 1 ELSE 0 END) = 0
-            THEN 'PASS' ELSE 'FAIL' END AS result
-FROM dbo.stg_covid_raw;
-
--- V-04: Date format is parseable
-SELECT 'V-04 date_format' AS check_name,
-       SUM(CASE WHEN TRY_CONVERT(DATE, date, 120) IS NULL THEN 1 ELSE 0 END) AS violations,
-       CASE WHEN SUM(CASE WHEN TRY_CONVERT(DATE, date, 120) IS NULL THEN 1 ELSE 0 END) = 0
-            THEN 'PASS' ELSE 'FAIL' END AS result
-FROM dbo.stg_covid_raw;
-
--- V-05: No duplicate location + date
-SELECT 'V-05 duplicates' AS check_name,
-       COUNT(*) - COUNT(DISTINCT location + '|' + date) AS violations,
-       CASE WHEN COUNT(*) - COUNT(DISTINCT location + '|' + date) = 0
-            THEN 'PASS' ELSE 'FAIL' END AS result
-FROM dbo.stg_covid_raw;
-
--- V-06: positive_rate in range (0-1) — WARN not fail
-SELECT 'V-06 positive_rate_range' AS check_name,
-       SUM(CASE WHEN TRY_CAST(positive_rate AS FLOAT) > 1 THEN 1 ELSE 0 END) AS violations,
-       'WARN' AS result
-FROM dbo.stg_covid_raw;
-
--- V-07: Negative new_cases — WARN not fail (OWID corrections)
-SELECT 'V-07 negative_cases' AS check_name,
-       SUM(CASE WHEN TRY_CAST(new_cases AS FLOAT) < 0 THEN 1 ELSE 0 END) AS violations,
-       'WARN' AS result
-FROM dbo.stg_covid_raw;
-```
-
----
-
-## Package 2 — Warehouse Build (Metadata-Driven)
-
-**Control flow inside Package 2:**
-
-```
-  Execute SQL Task
-  Generate run_id = CAST(NEWID() AS VARCHAR(50))
-  Store in SSIS variable: @run_id
-         │
-         ▼
-  Execute SQL Task
-  SELECT metadata_id, table_name, step_type, sql_file
-  FROM etl_metadata
-  WHERE is_active = 1
-  ORDER BY step_order
-  → Result stored in Object variable: @metadata_recordset
-         │
-         ▼
-  ForEach Loop Container
-  (ADO enumerator over @metadata_recordset)
-         │
-         ├─ Map variables: @metadata_id, @table_name, @step_type, @sql_file
-         │
-         ├─ Execute SQL Task: INSERT etl_execution_log
-         │  (run_id, metadata_id, status = 'RUNNING', start_time = GETDATE())
-         │
-         ├─ Execute SQL Task: Run the SQL from @sql_file
-         │  (Expression: "EXEC sp_executesql N'" + @sql_file_content + "'")
-         │
-         └─ Execute SQL Task: UPDATE etl_execution_log
-            SET status = 'DONE', end_time = GETDATE(), rows_affected = @@ROWCOUNT
-            On failure path → status = 'FAILED', error_message = @ErrorDescription
-```
-
----
-
-## Warehouse Table Definitions (SQL Server)
 
 ### dim_location
 ```sql
@@ -251,6 +310,7 @@ CREATE TABLE dbo.dim_location (
     life_expectancy              FLOAT,
     diabetes_prevalence          FLOAT,
     cardiovasc_death_rate        FLOAT,
+    human_development_index      FLOAT,
     load_timestamp               DATETIME DEFAULT GETDATE()
 );
 ```
@@ -273,33 +333,62 @@ CREATE TABLE dbo.dim_date (
 ### fact_covid_daily
 ```sql
 CREATE TABLE dbo.fact_covid_daily (
-    fact_id                          INT      IDENTITY(1,1) PRIMARY KEY,
-    record_year                      SMALLINT NOT NULL,
-    location_id                      INT      NOT NULL,
-    date_id                          INT      NOT NULL,
-    new_cases                        FLOAT,
-    total_cases                      FLOAT,
-    new_cases_per_million            FLOAT,
-    total_cases_per_million          FLOAT,
-    new_deaths                       FLOAT,
-    total_deaths                     FLOAT,
-    new_deaths_per_million           FLOAT,
-    total_deaths_per_million         FLOAT,
-    new_tests                        FLOAT,
-    total_tests                      FLOAT,
-    new_tests_per_thousand           FLOAT,
-    total_tests_per_thousand         FLOAT,
-    new_tests_smoothed               FLOAT,
-    new_tests_smoothed_per_thousand  FLOAT,
-    positive_rate                    FLOAT,
-    tests_per_case                   FLOAT,
-    stringency_index                 FLOAT,
-    deathp100k                       FLOAT,
-    mortality_rate                   FLOAT,
-    load_timestamp                   DATETIME DEFAULT GETDATE(),
-    CONSTRAINT fk_location  FOREIGN KEY (location_id) REFERENCES dbo.dim_location(location_id),
-    CONSTRAINT fk_date      FOREIGN KEY (date_id)     REFERENCES dbo.dim_date(date_id),
-    CONSTRAINT uq_loc_date  UNIQUE (location_id, date_id)
+    fact_id                                    INT      IDENTITY(1,1) PRIMARY KEY,
+    record_year                                SMALLINT NOT NULL,
+    location_id                                INT      NOT NULL,
+    date_id                                    INT      NOT NULL,
+    new_cases                                  FLOAT,
+    total_cases                                FLOAT,
+    new_cases_smoothed                         FLOAT,
+    new_cases_per_million                      FLOAT,
+    total_cases_per_million                    FLOAT,
+    new_cases_smoothed_per_million             FLOAT,
+    new_deaths                                 FLOAT,
+    total_deaths                               FLOAT,
+    new_deaths_smoothed                        FLOAT,
+    new_deaths_per_million                     FLOAT,
+    total_deaths_per_million                   FLOAT,
+    new_deaths_smoothed_per_million            FLOAT,
+    reproduction_rate                          FLOAT,
+    icu_patients                               FLOAT,
+    icu_patients_per_million                   FLOAT,
+    hosp_patients                              FLOAT,
+    hosp_patients_per_million                  FLOAT,
+    weekly_icu_admissions                      FLOAT,
+    weekly_icu_admissions_per_million          FLOAT,
+    weekly_hosp_admissions                     FLOAT,
+    weekly_hosp_admissions_per_million         FLOAT,
+    new_tests                                  FLOAT,
+    total_tests                                FLOAT,
+    new_tests_per_thousand                     FLOAT,
+    total_tests_per_thousand                   FLOAT,
+    new_tests_smoothed                         FLOAT,
+    new_tests_smoothed_per_thousand            FLOAT,
+    positive_rate                              FLOAT,
+    tests_per_case                             FLOAT,
+    tests_units                                VARCHAR(100),
+    total_vaccinations                         FLOAT,
+    people_vaccinated                          FLOAT,
+    people_fully_vaccinated                    FLOAT,
+    total_boosters                             FLOAT,
+    new_vaccinations                           FLOAT,
+    new_vaccinations_smoothed                  FLOAT,
+    total_vaccinations_per_hundred             FLOAT,
+    people_vaccinated_per_hundred              FLOAT,
+    people_fully_vaccinated_per_hundred        FLOAT,
+    total_boosters_per_hundred                 FLOAT,
+    new_vaccinations_smoothed_per_million      FLOAT,
+    new_people_vaccinated_smoothed             FLOAT,
+    new_people_vaccinated_smoothed_per_hundred FLOAT,
+    stringency_index                           FLOAT,
+    excess_mortality_cumulative_absolute       FLOAT,
+    excess_mortality_cumulative                FLOAT,
+    excess_mortality                           FLOAT,
+    excess_mortality_cumulative_per_million    FLOAT,
+    load_timestamp                             DATETIME DEFAULT GETDATE(),
+    CONSTRAINT fk_location FOREIGN KEY (location_id) REFERENCES dbo.dim_location(location_id),
+    CONSTRAINT fk_date     FOREIGN KEY (date_id)     REFERENCES dbo.dim_date(date_id),
+    CONSTRAINT uq_loc_date UNIQUE (location_id, date_id)
 );
 ```
 
@@ -307,7 +396,8 @@ CREATE TABLE dbo.fact_covid_daily (
 ```sql
 CREATE TABLE dbo.dq_rejected_rows (
     reject_id      INT           IDENTITY(1,1) PRIMARY KEY,
-    reject_reason  VARCHAR(20),  -- DQ-01 through DQ-06
+    reject_reason  VARCHAR(20),
+    source_file    VARCHAR(200),
     raw_location   VARCHAR(500),
     raw_date       VARCHAR(500),
     raw_continent  VARCHAR(500),
@@ -316,131 +406,146 @@ CREATE TABLE dbo.dq_rejected_rows (
 );
 ```
 
----
-
-## DQ Rules Applied in Package 2 Data Flows
-
-| Code | Rule | Applied in | Action |
-|------|------|-----------|--------|
-| DQ-01 | `continent IS NULL` — aggregate rows (World, Asia, etc.) | dim_location + fact flows | Route to dq_rejected_rows — expected, not an error |
-| DQ-02 | `date IS NULL` | fact flow | Route to dq_rejected_rows |
-| DQ-03 | `date > GETDATE()` — future dates | fact flow | Route to dq_rejected_rows |
-| DQ-04 | `location IS NULL` | fact flow | Route to dq_rejected_rows |
-| DQ-05 | location not found in dim_location — lookup miss | fact flow | Route to dq_rejected_rows |
-| DQ-06 | date not found in dim_date — lookup miss | fact flow | Route to dq_rejected_rows |
-
-**Negative new_cases:** Not rejected. OWID uses negative values to publish corrections
-to historical data. Loading them as-is ensures cumulative totals stay accurate.
-The post-load procedure flags the count as a warning.
-
----
-
-## Post-Load Verification (usp_verify_etl_load)
-
-Called as the final step in Package 2 via Execute SQL Task.
-Any RAISE ERROR causes the SSIS package to fail and alerts the operator.
-
-| Check | Type | Condition |
-|-------|------|-----------|
-| fact_covid_daily has rows | FAIL | COUNT(*) = 0 |
-| dim_location has rows | FAIL | COUNT(*) = 0 |
-| dim_date has rows | FAIL | COUNT(*) = 0 |
-| No orphan location_id | FAIL | FK mismatch exists |
-| No orphan date_id | FAIL | FK mismatch exists |
-| No null FK in fact table | FAIL | location_id or date_id IS NULL |
-| positive_rate > 1.0 | WARN | COUNT — logged, not failed |
-| Unexpected reject rate > 5% | FAIL | DQ-02 to DQ-06 rejects ÷ total rows |
-| Negative new_cases | WARN | COUNT — logged, not failed |
-
----
-
-## Snowflake Migration (Phase 5)
-
-Same star schema rebuilt in Snowflake. No schema redesign needed.
-
-```
-  SQL Server                       Snowflake
-  ──────────────                   ──────────────────────
-  Export dim_location   →  PUT  →  COPY INTO dim_location
-  Export dim_date       →  PUT  →  COPY INTO dim_date
-  Export fact_covid_daily → PUT → COPY INTO fact_covid_daily
+### etl_metadata
+```sql
+CREATE TABLE dbo.etl_metadata (
+    job_id            INT           IDENTITY(1,1) PRIMARY KEY,
+    step_order        INT           NOT NULL,
+    step_type         VARCHAR(20)   NOT NULL,
+    step_description  VARCHAR(500),
+    source_table      VARCHAR(100),
+    target_table      VARCHAR(100)  NOT NULL,
+    load_type_flag    CHAR(1)       DEFAULT 'R',
+    sql_statement     VARCHAR(MAX)  NOT NULL,
+    is_active         BIT           DEFAULT 1,
+    status            CHAR(1)       DEFAULT 'N',
+    restart_flag      CHAR(1)       DEFAULT 'N',
+    query_id          VARCHAR(200),
+    start_date        DATETIME,
+    end_date          DATETIME,
+    session_id        VARCHAR(100),
+    no_of_rows        BIGINT        DEFAULT 0,
+    etl_load_date     DATETIME,
+    error_message     VARCHAR(MAX)
+);
 ```
 
-Snowflake objects created:
-- `DATABASE: COVID_DWH`
-- `SCHEMA: ANALYTICS`
-- `WAREHOUSE: COMPUTE_WH (X-SMALL, auto-suspend 60s)`
-- `STAGE: COVID_STAGE`
-- `FILE FORMAT: CSV_FORMAT`
+### etl_execution_log
+```sql
+CREATE TABLE dbo.etl_execution_log (
+    log_id        INT          IDENTITY(1,1) PRIMARY KEY,
+    run_id        VARCHAR(50)  NOT NULL,
+    metadata_id   INT,
+    table_name    VARCHAR(100),
+    step_type     VARCHAR(50),
+    status        VARCHAR(20)  DEFAULT 'RUNNING',
+    start_time    DATETIME     DEFAULT GETDATE(),
+    end_time      DATETIME,
+    rows_affected INT          DEFAULT 0,
+    error_message VARCHAR(MAX)
+);
+```
 
-Power BI connects to Snowflake (not SQL Server) for production reporting.
+### etl_hist_metadata
+```sql
+CREATE TABLE dbo.etl_hist_metadata (
+    hist_id       INT          IDENTITY(1,1) PRIMARY KEY,
+    run_id        VARCHAR(50)  NOT NULL,
+    job_id        INT          NOT NULL,
+    start_date    DATETIME,
+    end_date      DATETIME,
+    status        CHAR(1)      NOT NULL,
+    query_id      VARCHAR(200),
+    no_of_rows    BIGINT       DEFAULT 0,
+    session_id    VARCHAR(100),
+    error_message VARCHAR(MAX),
+    etl_load_date DATETIME     DEFAULT GETDATE()
+);
+```
+
+### etl_validation
+```sql
+CREATE TABLE dbo.etl_validation (
+    validation_id      INT           IDENTITY(1,1) PRIMARY KEY,
+    run_id             VARCHAR(50)   NOT NULL,
+    table_name         VARCHAR(100)  NOT NULL,
+    test_layer         VARCHAR(20)   NOT NULL,
+    test_name          VARCHAR(200)  NOT NULL,
+    source_count       BIGINT,
+    destination_count  BIGINT,
+    match_pct          DECIMAL(5,2),
+    expected_value     VARCHAR(200),
+    actual_value       VARCHAR(200),
+    status             VARCHAR(10)   NOT NULL,
+    severity           VARCHAR(10)   NOT NULL DEFAULT 'CRITICAL',
+    message            VARCHAR(500),
+    executed_at        DATETIME      DEFAULT GETDATE()
+);
+```
 
 ---
 
-## Field Lineage — Where Every Column Comes From
+## etl_metadata Rows — Initial Population
 
-### dim_location
+| step_order | target_table | step_type | description |
+|------------|-------------|-----------|-------------|
+| 1 | dim_date | INSERT | Truncate + generate dates 2020-01-01 to today |
+| 2 | dim_location | INSERT | Truncate + load countries from staging (deduplicated) |
+| 3 | fact_covid_daily | INSERT | Truncate + load facts with FK lookups |
+| 4 | ml_covid_features | INSERT | Truncate + load wide flat table with lag features |
+| 5 | dim_location | VALIDATE | Row count vs staging distinct countries |
+| 6 | fact_covid_daily | VALIDATE | Row count vs staging (allow 5% DQ-01 rejects) |
+| 7 | fact_covid_daily | VALIDATE | SUM(new_cases) staging vs fact |
+| 8 | fact_covid_daily | VALIDATE | Business rules — rates, dates, duplicates |
 
-| Source Column | Transform in SSIS | Target Column | Notes |
-|--------------|-------------------|--------------|-------|
-| `location` | Pass-through | `country` | |
-| `iso_code` | Pass-through | `code` | |
-| `continent` | Pass-through | `continent` | DQ-01 removes null rows before this |
-| `population` | string → BIGINT | `population` | |
-| `population_density` | string → FLOAT | `population_density` | |
-| `median_age` | string → FLOAT | `median_age` | |
-| `aged_65_older` | string → FLOAT | `aged_65_older` | |
-| `aged_70_older` | string → FLOAT | `aged_70_older` | |
-| `gdp_per_capita` | string → FLOAT | `gdp_per_capita` | |
-| `extreme_poverty` | string → FLOAT | `extreme_poverty` | ~45% null |
-| `handwashing_facilities` | string → FLOAT | `handwashing_facilities` | ~35% null |
-| `female_smokers` | string → FLOAT | `female_smokers` | |
-| `male_smokers` | string → FLOAT | `male_smokers` | |
-| `hospital_beds_per_thousand` | string → FLOAT | `hospital_beds_per_thousand` | |
-| `life_expectancy` | string → FLOAT | `life_expectancy` | |
-| `diabetes_prevalence` | string → FLOAT | `diabetes_prevalence` | |
-| `cardiovasc_death_rate` | string → FLOAT | `cardiovasc_death_rate` | |
-| — | IDENTITY | `location_id` | Auto-generated surrogate key |
+---
 
-### dim_date
+## Load Strategy and Idempotency
 
-| Source | Transform | Target Column | Notes |
-|--------|-----------|--------------|-------|
-| Script Task — generated | None | `date` | 2020-01-01 → today |
-| Derived from date | YEAR(date) | `year` | |
-| Derived from date | MONTH(date) | `month` | |
-| Derived from date | DATENAME(month, date) | `month_name` | e.g. March |
-| Derived from date | 'Q' + CAST(DATEPART(quarter,date) AS VARCHAR) | `quarter` | e.g. Q1 |
-| Derived from date | DATEPART(iso_week, date) | `week_number` | |
-| Derived from date | DATENAME(weekday, date) | `day_of_week` | e.g. Monday |
-| Derived from date | CASE WHEN DATEPART(weekday,date) IN (1,7) THEN 1 ELSE 0 END | `is_weekend` | |
-| — | IDENTITY | `date_id` | Auto-generated surrogate key |
+| Table | Mode | Idempotent | Notes |
+|-------|------|-----------|-------|
+| stg_covid_raw | Truncate + full reload | Yes | Package 1 truncates before load |
+| dim_date | Truncate + regenerate | Yes | Fresh every run — 2020-01-01 to today |
+| dim_location | Truncate + reload | Yes | Deduplicated from staging |
+| fact_covid_daily | Truncate + reload | Yes | Full reload — OWID corrections applied |
+| ml_covid_features | Truncate + reload | Yes | Rebuilt from fact + lag calculation |
 
-### fact_covid_daily
+---
 
-| Source Column | Transform | Target Column | Notes |
-|--------------|-----------|--------------|-------|
-| `date` | string → DATE, then YEAR() | `record_year` | Partition key |
-| Lookup → dim_location | Match on location name | `location_id` | FK |
-| Lookup → dim_date | Match on date value | `date_id` | FK |
-| `new_cases` | string → FLOAT | `new_cases` | Negative = OWID correction |
-| `total_cases` | string → FLOAT | `total_cases` | |
-| `new_cases_per_million` | string → FLOAT | `new_cases_per_million` | Pre-computed |
-| `total_cases_per_million` | string → FLOAT | `total_cases_per_million` | Pre-computed |
-| `new_deaths` | string → FLOAT | `new_deaths` | Negative = OWID correction |
-| `total_deaths` | string → FLOAT | `total_deaths` | |
-| `new_deaths_per_million` | string → FLOAT | `new_deaths_per_million` | Pre-computed |
-| `total_deaths_per_million` | string → FLOAT | `total_deaths_per_million` | Pre-computed |
-| `new_tests` | string → FLOAT | `new_tests` | ~50% null |
-| `total_tests` | string → FLOAT | `total_tests` | |
-| `new_tests_per_thousand` | string → FLOAT | `new_tests_per_thousand` | Pre-computed |
-| `total_tests_per_thousand` | string → FLOAT | `total_tests_per_thousand` | Pre-computed |
-| `new_tests_smoothed` | string → FLOAT | `new_tests_smoothed` | 7-day avg, pre-computed |
-| `new_tests_smoothed_per_thousand` | string → FLOAT | `new_tests_smoothed_per_thousand` | Pre-computed |
-| `positive_rate` | string → FLOAT | `positive_rate` | ~82% null — warn if > 1.0 |
-| `tests_per_case` | string → FLOAT | `tests_per_case` | Nullable |
-| `stringency_index` | string → FLOAT | `stringency_index` | 0–100 |
-| `Deathp100K` | string → FLOAT | `deathp100k` | Pre-computed |
-| `Mortality Rate` | string → FLOAT | `mortality_rate` | Pre-computed |
-| `Number of Records` | Excluded | — | BI artifact |
-| `Waterfall` | Excluded | — | BI artifact |
+## Field Lineage — dim_location
+
+| Source Column | SSIS Transform | Target Column |
+|--------------|---------------|--------------|
+| location | Pass-through | country |
+| iso_code | Pass-through | code |
+| continent | Pass-through — DQ-01 removes nulls | continent |
+| population | string → BIGINT | population |
+| population_density | string → FLOAT | population_density |
+| median_age | string → FLOAT | median_age |
+| aged_65_older | string → FLOAT | aged_65_older |
+| aged_70_older | string → FLOAT | aged_70_older |
+| gdp_per_capita | string → FLOAT | gdp_per_capita |
+| extreme_poverty | string → FLOAT | extreme_poverty |
+| handwashing_facilities | string → FLOAT | handwashing_facilities |
+| female_smokers | string → FLOAT | female_smokers |
+| male_smokers | string → FLOAT | male_smokers |
+| hospital_beds_per_thousand | string → FLOAT | hospital_beds_per_thousand |
+| life_expectancy | string → FLOAT | life_expectancy |
+| diabetes_prevalence | string → FLOAT | diabetes_prevalence |
+| cardiovasc_death_rate | string → FLOAT | cardiovasc_death_rate |
+| human_development_index | string → FLOAT | human_development_index |
+| — | IDENTITY | location_id |
+
+## Field Lineage — dim_date
+
+| Source | Transform | Target Column |
+|--------|-----------|--------------|
+| Script Task | Generated 2020-01-01 → today | date |
+| Derived | YEAR(date) | year |
+| Derived | MONTH(date) | month |
+| Derived | DATENAME(month, date) | month_name |
+| Derived | 'Q'+CAST(DATEPART(quarter,date) AS VARCHAR) | quarter |
+| Derived | DATEPART(iso_week, date) | week_number |
+| Derived | DATENAME(weekday, date) | day_of_week |
+| Derived | CASE WHEN DATEPART(weekday,date) IN (1,7) THEN 1 ELSE 0 END | is_weekend |
+| — | IDENTITY | date_id |

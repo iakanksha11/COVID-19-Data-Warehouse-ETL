@@ -45,10 +45,10 @@ testing, policy effectiveness, and socioeconomic risk factors.
   │   dim_date          │  Every step logged to etl_execution_log
   │   fact_covid_daily  │  restart_flag=Y on failure — safe to re-run
   └─────────┬───────────┘
-            │  Run test suite before migrating
+            │  Run test suite before reporting
             ▼
   ┌─────────────────────┐
-  │   Test Layer        │  Four guards — ALL must pass before Snowflake
+  │   Test Layer        │  Four guards — ALL must pass before Power BI
   │   SQL Server        │
   │                     │  Layer 1: Volume   — source vs destination counts
   │   etl_validation    │  Layer 2: Schema   — columns, nulls, types
@@ -59,18 +59,16 @@ testing, policy effectiveness, and socioeconomic risk factors.
             │  Any CRITICAL FAIL → stop, fix ETL, re-run
             ▼
   ┌─────────────────────┐
-  │   Snowflake         │  Production warehouse
-  │   Warehouse         │  Same star schema — rebuilt via COPY INTO
-  │                     │  Same test suite reruns after migration
-  │   COVID_DWH         │  All tests must PASS before Power BI connects
-  └─────────┬───────────┘
-            │  All Snowflake tests PASS → proceed
-            ▼
-  ┌─────────────────────┐
-  │   Analytics         │  Power BI dashboards (exploratory)
+  │   Analytics         │  Power BI connects directly to SQL Server
+  │                     │  Star schema dashboards — 8 business reports
   │                     │  SSMS SQL queries (ad hoc)
-  │                     │  8 business question reports
   └─────────────────────┘
+
+  ── Future Phase ──────────────────────────────────────────────────
+  SQL Server → Snowflake migration (same schema, COPY INTO)
+  Power BI reconnects to Snowflake
+  Same test suite reruns after migration
+  ──────────────────────────────────────────────────────────────────
 ```
 
 ---
@@ -89,8 +87,7 @@ This prevents the entire package from crashing on one malformed date or null num
 
 **Reject table with reason codes.** Bad rows are never silently dropped. Every
 rejected row goes to `dq_rejected_rows` with a DQ reason code (DQ-01 through DQ-06),
-the source values, and a timestamp. This lets you investigate what went wrong
-without re-reading the CSV.
+the source values, and a timestamp.
 
 **Full reload strategy.** The fact table is truncated and fully reloaded on every run.
 OWID publishes historical corrections — incremental load would miss them. At 429k rows,
@@ -98,8 +95,7 @@ full reload completes in minutes and is far simpler to maintain than change dete
 
 **Four-layer test strategy.** Reporting alone does not assure correctness. A dedicated
 test suite runs after every ETL load — before data reaches Power BI. Tests are stored
-in `etl_validation` table with full history per run_id. Results drive a go/no-go
-decision at two gates: after SQL Server load, and after Snowflake migration.
+in `etl_validation` table with full history per run_id.
 
 ---
 
@@ -118,9 +114,9 @@ decision at two gates: after SQL Server load, and after Snowflake migration.
 **Grain:** one row = one country on one date.
 
 **dim_location** — one row per country (~195 rows after DQ-01 filter removes
-aggregate locations). Stores 15 static country-level attributes that do not change
-daily: population, GDP per capita, median age, life expectancy, hospital beds,
-smoking rates, poverty levels, HDI.
+aggregate locations). Stores 15 static country-level attributes: population,
+GDP per capita, median age, life expectancy, hospital beds, smoking rates,
+poverty levels, HDI.
 
 **dim_date** — one row per calendar date. Generated programmatically — not read
 from CSV. Stores year, month, quarter, week number, day of week, is_weekend.
@@ -129,20 +125,18 @@ Covers 2020-01-01 to today (~1,688 rows).
 **fact_covid_daily** — one row per country per date (~400k rows after DQ filtering).
 Stores 52 daily-changing measures: case counts, death counts, testing, vaccination
 rollout, hospitalisation, reproduction rate, policy stringency, excess mortality.
-Foreign keys to both dimensions.
 
 ---
 
 ## Test Strategy
 
-Testing sits between the SQL Server warehouse load and Snowflake migration.
-The same test suite runs twice — once against SQL Server, once against Snowflake.
+Testing sits between the SQL Server warehouse load and Power BI reporting.
+All CRITICAL tests must pass before Power BI connects.
 
 ### Why four layers — not just row counts
 
 Row count matching alone can lie. If SSIS loads new_cases into new_deaths column,
 row count shows 100% match but data is completely wrong.
-Four layers together catch what counts alone cannot.
 
 ### The four test layers
 
@@ -189,7 +183,7 @@ etl_validation
 
 | Result | Action |
 |--------|--------|
-| All CRITICAL tests PASS | Proceed to next layer |
+| All CRITICAL tests PASS | Connect Power BI |
 | Any CRITICAL test FAIL | Stop — fix ETL — re-run |
 | WARN | Log and proceed — investigate after |
 
@@ -205,9 +199,8 @@ etl_validation
 | Warehouse load | SSIS Package 2 | Metadata-driven — builds dims + fact |
 | Audit | etl_execution_log | Every step logged — status, rows, timing, errors |
 | **Test layer** | **etl_validation table** | **Four layers — CRITICAL pass required** |
-| SQL Server → Snowflake | ODBC / COPY INTO | Migrate only after all CRITICAL tests pass |
-| Snowflake validation | Same test suite | Reruns against Snowflake after migration |
-| Reporting | Power BI | Star schema dashboards — 8 business reports |
+| Reporting | Power BI | Connects to SQL Server — 8 business reports |
+| *Future* | *Snowflake migration* | *Same schema — migrate when project complete* |
 
 ---
 
@@ -215,14 +208,12 @@ etl_validation
 
 | Decision | Choice | Why |
 |----------|--------|-----|
-| Schema type | Star schema | One JOIN to any dimension — simple queries, fast, BI-friendly |
-| Modelling approach | Kimball | Build from business questions outward, not from source inward |
-| ETL control | Metadata-driven | Config change instead of package rebuild when steps change |
+| Schema type | Star schema | One JOIN to any dimension — simple, fast, BI-friendly |
+| Modelling approach | Kimball | Build from business questions outward |
+| ETL control | Metadata-driven | Config change instead of package rebuild |
 | Staging type cast | VARCHAR first, cast second | Prevents package crash on dirty data |
-| Load strategy | Full truncate + reload | OWID publishes corrections — incremental would miss them |
-| Reject handling | dq_rejected_rows table | Never silently drop bad rows — always traceable |
-| Artifact columns | None to drop | Full OWID dataset has no Tableau artifacts |
-| Test strategy | Four layers in etl_validation | Row count alone cannot detect column swaps or value errors |
-| Test gates | Two gates — SQL Server + Snowflake | Verify data at each environment before proceeding |
-| SQL Server role | Staging + validation + test gate | Don't move untested data to Snowflake |
-| Snowflake role | Production warehouse | Power BI connects here — tests rerun after migration |
+| Load strategy | Full truncate + reload | OWID publishes corrections — incremental misses them |
+| Reject handling | dq_rejected_rows table | Never silently drop bad rows |
+| Test strategy | Four layers in etl_validation | Row count alone cannot detect value errors |
+| Snowflake | Deferred to future phase | SQL Server sufficient for current scope — avoid complexity |
+| Power BI target | SQL Server (now) | Direct connection — no migration needed to start reporting |
